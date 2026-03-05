@@ -815,6 +815,22 @@ export class OverlayFs implements IFileSystem {
     const canonical = this.resolveRealPath_(this.toRealPath(normalized));
     if (canonical) {
       try {
+        // Defense-in-depth lstat check: if the directory at `canonical` was
+        // replaced with a symlink between resolveRealPath_() and readdir,
+        // lstat detects it.  Node.js has no fd-based readdir, so a tiny
+        // TOCTOU window remains between this lstat and the readdir below.
+        if (!this.allowSymlinks) {
+          const dirStat = await fs.promises.lstat(canonical);
+          if (dirStat.isSymbolicLink()) {
+            // Treat as non-existent — don't leak real-FS entries
+            if (!this.memory.has(normalized)) {
+              throw new Error(
+                `ENOENT: no such file or directory, scandir '${path}'`,
+              );
+            }
+            return entriesMap;
+          }
+        }
         const realEntries = await fs.promises.readdir(canonical, {
           withFileTypes: true,
         });

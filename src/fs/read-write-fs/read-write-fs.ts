@@ -270,11 +270,18 @@ export class ReadWriteFs implements IFileSystem {
     const canonical = this.resolveAndValidate(realPath, path);
 
     try {
-      const stat = await fs.promises.stat(canonical);
+      // Use lstat instead of stat to close a TOCTOU gap: if the file at
+      // `canonical` is replaced with a symlink between resolveAndValidate()
+      // and this call, lstat detects it (returns isSymbolicLink() = true)
+      // instead of following it.
+      const stat = await fs.promises.lstat(canonical);
+      if (!this.allowSymlinks && stat.isSymbolicLink()) {
+        throw new Error(`EACCES: permission denied, '${path}' is a symlink`);
+      }
       return {
         isFile: stat.isFile(),
         isDirectory: stat.isDirectory(),
-        isSymbolicLink: false, // stat follows symlinks
+        isSymbolicLink: stat.isSymbolicLink(),
         mode: stat.mode,
         size: stat.size,
         mtime: stat.mtime,
@@ -342,6 +349,16 @@ export class ReadWriteFs implements IFileSystem {
     const canonical = this.resolveAndValidate(realPath, path);
 
     try {
+      // Defense-in-depth lstat check: if the directory at `canonical` was
+      // replaced with a symlink between resolveAndValidate() and readdir,
+      // lstat detects it.  Node.js has no fd-based readdir, so a tiny
+      // TOCTOU window remains between this lstat and the readdir below.
+      if (!this.allowSymlinks) {
+        const dirStat = await fs.promises.lstat(canonical);
+        if (dirStat.isSymbolicLink()) {
+          throw new Error(`EACCES: permission denied, '${path}' is a symlink`);
+        }
+      }
       const entries = await fs.promises.readdir(canonical, {
         withFileTypes: true,
       });
@@ -652,11 +669,27 @@ export class ReadWriteFs implements IFileSystem {
     const canonical = this.resolveAndValidate(realPath, path);
 
     try {
-      await fs.promises.chmod(canonical, mode);
+      // Use open(O_NOFOLLOW) + fh.chmod() to close a TOCTOU gap: if the
+      // file at `canonical` is replaced with a symlink between
+      // resolveAndValidate() and this call, O_NOFOLLOW makes it fail with
+      // ELOOP instead of following it.
+      const flags = this.allowSymlinks
+        ? fs.constants.O_RDONLY
+        : fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
+      const fh = await fs.promises.open(canonical, flags);
+      try {
+        await fh.chmod(mode);
+      } finally {
+        await fh.close();
+      }
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
       if (err.code === "ENOENT") {
         throw new Error(`ENOENT: no such file or directory, chmod '${path}'`);
+      }
+      if (err.code === "ELOOP") {
+        // O_NOFOLLOW caught a symlink swap (TOCTOU defense)
+        throw new Error(`EACCES: permission denied, '${path}' is a symlink`);
       }
       this.sanitizeError(e, path, "chmod");
     }
@@ -854,11 +887,27 @@ export class ReadWriteFs implements IFileSystem {
     const canonical = this.resolveAndValidate(realPath, path);
 
     try {
-      await fs.promises.utimes(canonical, atime, mtime);
+      // Use open(O_NOFOLLOW) + fh.utimes() to close a TOCTOU gap: if the
+      // file at `canonical` is replaced with a symlink between
+      // resolveAndValidate() and this call, O_NOFOLLOW makes it fail with
+      // ELOOP instead of following it.
+      const flags = this.allowSymlinks
+        ? fs.constants.O_RDONLY
+        : fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
+      const fh = await fs.promises.open(canonical, flags);
+      try {
+        await fh.utimes(atime, mtime);
+      } finally {
+        await fh.close();
+      }
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
       if (err.code === "ENOENT") {
         throw new Error(`ENOENT: no such file or directory, utimes '${path}'`);
+      }
+      if (err.code === "ELOOP") {
+        // O_NOFOLLOW caught a symlink swap (TOCTOU defense)
+        throw new Error(`EACCES: permission denied, '${path}' is a symlink`);
       }
       this.sanitizeError(e, path, "utimes");
     }

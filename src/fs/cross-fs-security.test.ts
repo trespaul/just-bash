@@ -1086,6 +1086,284 @@ describe.each([
       expect(entries).toContain("nested.txt");
     });
   });
+
+  // -----------------------------------------------------------------------
+  // 35. mv to escape symlink destination
+  // -----------------------------------------------------------------------
+  describe("mv to escape symlink destination", () => {
+    it("mv to path through escape symlink never writes outside sandbox", async () => {
+      try {
+        fs.symlinkSync(ctx.outsideDir, path.join(ctx.tempDir, "mv-esc-dir"));
+      } catch {
+        return;
+      }
+
+      try {
+        await ctx.fsImpl.mv("/hello.txt", "/mv-esc-dir/stolen.txt");
+      } catch {
+        // Expected for ReadWriteFs (resolveAndValidate rejects)
+      }
+
+      // Must NOT have created a file outside the sandbox
+      expect(fs.existsSync(path.join(ctx.outsideDir, "stolen.txt"))).toBe(
+        false,
+      );
+    });
+
+    it("mv to broken escape symlink never creates file outside", async () => {
+      const brokenTarget = path.join(ctx.outsideDir, "mv-broken.txt");
+      try {
+        fs.symlinkSync(brokenTarget, path.join(ctx.tempDir, "mv-broken-esc"));
+      } catch {
+        return;
+      }
+
+      try {
+        await ctx.fsImpl.mv("/hello.txt", "/mv-broken-esc");
+      } catch {
+        // Expected
+      }
+
+      expect(fs.existsSync(brokenTarget)).toBe(false);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 36. mv directory with nested escape symlinks
+  // -----------------------------------------------------------------------
+  describe("mv directory with nested escape symlinks", () => {
+    it("mv dir containing escape symlink is blocked or doesn't leak", async () => {
+      // Create a directory with an escape symlink inside
+      fs.mkdirSync(path.join(ctx.tempDir, "movable"));
+      fs.writeFileSync(
+        path.join(ctx.tempDir, "movable", "safe.txt"),
+        "safe data",
+      );
+      try {
+        fs.symlinkSync(
+          ctx.outsideFile,
+          path.join(ctx.tempDir, "movable", "escape-inside"),
+        );
+      } catch {
+        return;
+      }
+
+      try {
+        await ctx.fsImpl.mv("/movable", "/moved-dir");
+      } catch {
+        // If it throws, that's safe
+        return;
+      }
+
+      // If mv succeeded, verify no outside content is accessible
+      await expect(
+        ctx.fsImpl.readFile("/moved-dir/escape-inside"),
+      ).rejects.toThrow();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 37. Self-referencing symlink (infinite recursion prevention)
+  // -----------------------------------------------------------------------
+  describe("self-referencing symlink", () => {
+    it("real-FS self-referencing symlink does not cause infinite recursion", async () => {
+      try {
+        fs.symlinkSync("self-ref", path.join(ctx.tempDir, "self-ref"));
+      } catch {
+        return;
+      }
+
+      // Should throw ELOOP or ENOENT, never hang
+      await expect(ctx.fsImpl.readFile("/self-ref")).rejects.toThrow();
+      await expect(ctx.fsImpl.stat("/self-ref")).rejects.toThrow();
+    });
+
+    it("memory-layer self-referencing symlink throws", async () => {
+      await ctx.fsImpl.symlink("/mem-self", "/mem-self");
+      // ReadWriteFs creates a real self-referencing symlink → realpathSync
+      // returns ELOOP → resolveCanonicalPath returns null → EACCES.
+      // OverlayFs resolves in memory → seen set detects loop → ELOOP.
+      // Either error code is safe — the key invariant is no hang.
+      await expect(ctx.fsImpl.readFile("/mem-self")).rejects.toThrow();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 38. Mutual symlink loop on real FS
+  // -----------------------------------------------------------------------
+  describe("mutual symlink loop on real FS", () => {
+    it("a -> b -> a does not cause infinite recursion or hang", async () => {
+      try {
+        fs.symlinkSync(
+          path.join(ctx.tempDir, "loop-b"),
+          path.join(ctx.tempDir, "loop-a"),
+        );
+        fs.symlinkSync(
+          path.join(ctx.tempDir, "loop-a"),
+          path.join(ctx.tempDir, "loop-b"),
+        );
+      } catch {
+        return;
+      }
+
+      await expect(ctx.fsImpl.readFile("/loop-a")).rejects.toThrow();
+      await expect(ctx.fsImpl.readFile("/loop-b")).rejects.toThrow();
+      await expect(ctx.fsImpl.stat("/loop-a")).rejects.toThrow();
+      await expect(ctx.fsImpl.stat("/loop-b")).rejects.toThrow();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 39. Symlink chain leaving and re-entering sandbox
+  // -----------------------------------------------------------------------
+  describe("symlink chain that leaves and re-enters sandbox", () => {
+    it("allows read when chain leaves and re-enters (final target within root)", async () => {
+      // With allowSymlinks: true, the security boundary checks the FINAL
+      // resolved target. A chain that leaves and comes back is OK because
+      // realpathSync resolves the full chain and the final target is within root.
+      const backLink = path.join(ctx.outsideDir, "back-link");
+      try {
+        fs.symlinkSync(path.join(ctx.tempDir, "hello.txt"), backLink);
+        fs.symlinkSync(backLink, path.join(ctx.tempDir, "chain-escape"));
+      } catch {
+        return;
+      }
+
+      // With allowSymlinks: true, this should succeed — final target is /hello.txt
+      const content = await ctx.fsImpl.readFile("/chain-escape");
+      expect(content).toBe("hello");
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 40. appendFile through escape symlink
+  // -----------------------------------------------------------------------
+  describe("appendFile through escape symlink", () => {
+    it("appendFile to escape symlink does not modify outside file", async () => {
+      try {
+        fs.symlinkSync(
+          ctx.outsideFile,
+          path.join(ctx.tempDir, "append-esc-link"),
+        );
+      } catch {
+        return;
+      }
+
+      try {
+        await ctx.fsImpl.appendFile("/append-esc-link", "INJECTED");
+      } catch {
+        // Expected for ReadWriteFs
+      }
+
+      // Outside file must not be modified
+      expect(fs.readFileSync(ctx.outsideFile, "utf8")).toBe("TOP SECRET");
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 41. cp recursive with escape symlink in nested directory
+  // -----------------------------------------------------------------------
+  describe("cp recursive with nested escape symlinks", () => {
+    it("cp -r skips escape symlinks in subdirectories", async () => {
+      // Create directory tree with escape symlinks buried inside
+      fs.mkdirSync(path.join(ctx.tempDir, "cp-src"));
+      fs.mkdirSync(path.join(ctx.tempDir, "cp-src", "deep"));
+      fs.writeFileSync(
+        path.join(ctx.tempDir, "cp-src", "safe.txt"),
+        "safe data",
+      );
+      try {
+        fs.symlinkSync(
+          ctx.outsideFile,
+          path.join(ctx.tempDir, "cp-src", "deep", "escape-link"),
+        );
+      } catch {
+        return;
+      }
+
+      try {
+        await ctx.fsImpl.cp("/cp-src", "/cp-dest", { recursive: true });
+      } catch {
+        // Throwing is safe
+        return;
+      }
+
+      // If cp succeeded, the escape symlink must not have leaked outside content
+      try {
+        const content = await ctx.fsImpl.readFile("/cp-dest/deep/escape-link");
+        expect(content).not.toContain("TOP SECRET");
+      } catch {
+        // ENOENT is fine — symlink was filtered out
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 42. mkdir through escape symlink intermediate
+  // -----------------------------------------------------------------------
+  describe("mkdir through escape symlink intermediate", () => {
+    it("mkdir through escape dir symlink fails or doesn't create outside dir", async () => {
+      try {
+        fs.symlinkSync(ctx.outsideDir, path.join(ctx.tempDir, "mkdir-esc-dir"));
+      } catch {
+        return;
+      }
+
+      try {
+        await ctx.fsImpl.mkdir("/mkdir-esc-dir/new-subdir", {
+          recursive: true,
+        });
+      } catch {
+        // Expected: resolveAndValidate rejects
+      }
+
+      // Must NOT have created a directory outside the sandbox
+      expect(fs.existsSync(path.join(ctx.outsideDir, "new-subdir"))).toBe(
+        false,
+      );
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 43. mv with relative symlink that would escape after relocation
+  // -----------------------------------------------------------------------
+  describe("mv with relative symlink that escapes after relocation", () => {
+    it("relative symlink safe at source but escaping at dest is caught", async () => {
+      // Create /deep/dir/ and a relative symlink at /deep/dir/link -> ../safe.txt
+      // This resolves to /deep/safe.txt (within sandbox)
+      fs.mkdirSync(path.join(ctx.tempDir, "deep", "dir"), { recursive: true });
+      fs.writeFileSync(path.join(ctx.tempDir, "deep", "safe.txt"), "safe");
+      try {
+        fs.symlinkSync(
+          "../safe.txt",
+          path.join(ctx.tempDir, "deep", "dir", "rel-link"),
+        );
+      } catch {
+        return;
+      }
+
+      // Now move /deep/dir/ to /dir-at-root/
+      // After move, rel-link -> ../safe.txt would resolve to /<parent-of-root>/safe.txt
+      // which is OUTSIDE the sandbox!
+      try {
+        await ctx.fsImpl.mv("/deep/dir", "/dir-at-root");
+      } catch {
+        // If mv throws (e.g., findEscapingSymlinks detects escape), that's safe
+        return;
+      }
+
+      // If mv succeeded (OverlayFs does cp+rm in memory), verify the symlink
+      // doesn't provide access to anything outside the sandbox
+      try {
+        const content = await ctx.fsImpl.readFile("/dir-at-root/rel-link");
+        // If readable, it must resolve within sandbox (/../safe.txt -> /safe.txt)
+        // and not leak outside data
+        expect(content).not.toContain("TOP SECRET");
+      } catch {
+        // Throwing is also safe
+      }
+    });
+  });
 });
 
 // ===========================================================================
@@ -1363,6 +1641,153 @@ describe("OverlayFs-specific security", () => {
 
       // Now reading returns the memory-layer content, not outside data
       expect(await overlay.readFile("/shadow-link")).toBe("safe content");
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // "Unshadow" attack: delete memory shadow to re-expose real escape symlink
+  // -----------------------------------------------------------------------
+  describe("unshadow attack — delete shadow re-exposes blocked real symlink", () => {
+    it("deleting a shadow file blocks the underlying escape symlink via deleted set", async () => {
+      // Create real-fs escape symlink
+      try {
+        fs.symlinkSync(outsideFile, path.join(tempDir, "unshadow-target"));
+      } catch {
+        return;
+      }
+
+      const overlay = new OverlayFs({
+        root: tempDir,
+        mountPoint: "/",
+        allowSymlinks: true,
+      });
+
+      // Shadow the escape symlink with a safe memory file
+      await overlay.writeFile("/unshadow-target", "safe content");
+      expect(await overlay.readFile("/unshadow-target")).toBe("safe content");
+
+      // Delete the shadow — this should add to deleted set, NOT fall through
+      // to the real escape symlink
+      await overlay.rm("/unshadow-target");
+
+      // Reading should now throw ENOENT (deleted set), NOT leak outside content
+      await expect(overlay.readFile("/unshadow-target")).rejects.toThrow(
+        "ENOENT",
+      );
+    });
+
+    it("write-delete-write cycle doesn't leak through real escape symlink", async () => {
+      try {
+        fs.symlinkSync(outsideFile, path.join(tempDir, "cycle-target"));
+      } catch {
+        return;
+      }
+
+      const overlay = new OverlayFs({
+        root: tempDir,
+        mountPoint: "/",
+        allowSymlinks: true,
+      });
+
+      // Cycle: write -> delete -> read (should be ENOENT, not outside data)
+      await overlay.writeFile("/cycle-target", "v1");
+      await overlay.rm("/cycle-target");
+      await expect(overlay.readFile("/cycle-target")).rejects.toThrow("ENOENT");
+
+      // Re-write -> delete -> read again
+      await overlay.writeFile("/cycle-target", "v2");
+      expect(await overlay.readFile("/cycle-target")).toBe("v2");
+      await overlay.rm("/cycle-target");
+      await expect(overlay.readFile("/cycle-target")).rejects.toThrow("ENOENT");
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Memory-layer symlink chains
+  // -----------------------------------------------------------------------
+  describe("memory-layer symlink chains", () => {
+    it("follows multi-hop memory symlink chain (a->b->c->file)", async () => {
+      const overlay = new OverlayFs({
+        root: tempDir,
+        mountPoint: "/",
+        allowSymlinks: true,
+      });
+
+      await overlay.writeFile("/target-file.txt", "chain target");
+      await overlay.symlink("/target-file.txt", "/chain-c");
+      await overlay.symlink("/chain-c", "/chain-b");
+      await overlay.symlink("/chain-b", "/chain-a");
+
+      const content = await overlay.readFile("/chain-a");
+      expect(content).toBe("chain target");
+    });
+
+    it("memory symlink pointing outside mount point returns ENOENT", async () => {
+      const overlay = new OverlayFs({
+        root: tempDir,
+        mountPoint: "/mnt/project",
+        allowSymlinks: true,
+      });
+
+      // Write a file and a symlink under the mount point
+      await overlay.writeFile("/mnt/project/file.txt", "data");
+
+      // Symlink pointing to something outside the mount point
+      await overlay.symlink("/etc/passwd", "/mnt/project/outside-link");
+
+      // Reading the symlink resolves to /etc/passwd which is outside mount
+      // point — should not be accessible from real FS
+      await expect(
+        overlay.readFile("/mnt/project/outside-link"),
+      ).rejects.toThrow();
+    });
+
+    it("memory symlink chain with loop throws ELOOP", async () => {
+      const overlay = new OverlayFs({
+        root: tempDir,
+        mountPoint: "/",
+        allowSymlinks: true,
+      });
+
+      // Three-way cycle: x -> y -> z -> x
+      await overlay.symlink("/sym-y", "/sym-x");
+      await overlay.symlink("/sym-z", "/sym-y");
+      await overlay.symlink("/sym-x", "/sym-z");
+
+      await expect(overlay.readFile("/sym-x")).rejects.toThrow("ELOOP");
+      await expect(overlay.stat("/sym-y")).rejects.toThrow("ELOOP");
+      await expect(overlay.realpath("/sym-z")).rejects.toThrow("ELOOP");
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // OverlayFs: readdir on memory symlink to real dir
+  // -----------------------------------------------------------------------
+  describe("readdir through memory symlink to real directory", () => {
+    it("memory symlink to real dir within mount works", async () => {
+      const overlay = new OverlayFs({
+        root: tempDir,
+        mountPoint: "/",
+        allowSymlinks: true,
+      });
+
+      await overlay.symlink("/sub", "/sub-mem-alias");
+      const entries = await overlay.readdir("/sub-mem-alias");
+      expect(entries).toContain("nested.txt");
+    });
+
+    it("memory symlink to path outside mount returns empty", async () => {
+      const overlay = new OverlayFs({
+        root: tempDir,
+        mountPoint: "/mnt/project",
+        allowSymlinks: true,
+      });
+
+      // Symlink pointing outside the mount
+      await overlay.symlink("/etc", "/mnt/project/etc-link");
+      const entries = await overlay.readdir("/mnt/project/etc-link");
+      // Should be empty since /etc is outside the overlay
+      expect(entries).toEqual([]);
     });
   });
 });

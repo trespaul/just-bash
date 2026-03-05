@@ -264,6 +264,242 @@ describe.each([
 });
 
 // ---------------------------------------------------------------------------
+// Additional default-deny attack vectors
+// ---------------------------------------------------------------------------
+describe.each([
+  ["OverlayFs", setupOverlay],
+  ["ReadWriteFs", setupReadWrite],
+])("%s — advanced default-deny attacks", (_name, factory) => {
+  let ctx: TestContext;
+
+  beforeEach(() => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-nosym-"));
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-nosym-out-"));
+    fs.writeFileSync(path.join(outsideDir, "secret.txt"), "TOP SECRET");
+    fs.writeFileSync(path.join(tempDir, "hello.txt"), "hello");
+    fs.mkdirSync(path.join(tempDir, "subdir"));
+    fs.writeFileSync(
+      path.join(tempDir, "subdir", "nested.txt"),
+      "nested content",
+    );
+    // Escape symlink pointing outside
+    fs.symlinkSync(outsideDir, path.join(tempDir, "escape-dir"));
+    // File escape symlink
+    fs.symlinkSync(
+      path.join(outsideDir, "secret.txt"),
+      path.join(tempDir, "escape-file"),
+    );
+
+    ctx = { tempDir, outsideDir, fsImpl: factory(tempDir) };
+  });
+
+  afterEach(() => {
+    fs.rmSync(ctx.tempDir, { recursive: true, force: true });
+    fs.rmSync(ctx.outsideDir, { recursive: true, force: true });
+  });
+
+  describe("mkdir through escape symlink", () => {
+    it("blocks mkdir through escape dir symlink", async () => {
+      try {
+        await ctx.fsImpl.mkdir("/escape-dir/new-subdir", { recursive: true });
+      } catch {
+        // Expected: resolveAndValidate rejects symlink traversal
+      }
+
+      // Must NOT have created a directory outside the sandbox
+      expect(fs.existsSync(path.join(ctx.outsideDir, "new-subdir"))).toBe(
+        false,
+      );
+    });
+  });
+
+  describe("rm on symlink entry (default deny)", () => {
+    it("cannot rm a symlink entry when symlinks are disabled", async () => {
+      // resolveAndValidate detects the symlink and rejects the path.
+      // This means pre-existing real-FS symlinks cannot be deleted via rm
+      // when allowSymlinks is false. This is expected behavior.
+      if (_name === "OverlayFs") {
+        // OverlayFs rm just marks as deleted in memory — doesn't touch real FS
+        await ctx.fsImpl.rm("/escape-file");
+        // After rm, the symlink is masked by the deleted set
+        expect(await ctx.fsImpl.exists("/escape-file")).toBe(false);
+        // Real symlink still exists on disk
+        expect(
+          fs.lstatSync(path.join(ctx.tempDir, "escape-file")).isSymbolicLink(),
+        ).toBe(true);
+      } else {
+        // ReadWriteFs: resolveAndValidate rejects, so rm throws
+        await expect(ctx.fsImpl.rm("/escape-file")).rejects.toThrow();
+        // Symlink still exists
+        expect(
+          fs.lstatSync(path.join(ctx.tempDir, "escape-file")).isSymbolicLink(),
+        ).toBe(true);
+      }
+    });
+  });
+
+  describe("writeFile through escape dir symlink", () => {
+    it("blocks writeFile when parent dir is a symlink to outside", async () => {
+      try {
+        await ctx.fsImpl.writeFile("/escape-dir/planted.txt", "PWNED");
+      } catch {
+        // Expected
+      }
+
+      // Must NOT have created a file outside the sandbox
+      expect(fs.existsSync(path.join(ctx.outsideDir, "planted.txt"))).toBe(
+        false,
+      );
+    });
+  });
+
+  describe("mv through escape symlink", () => {
+    it("blocks mv to path through escape dir symlink", async () => {
+      try {
+        await ctx.fsImpl.mv("/hello.txt", "/escape-dir/moved.txt");
+      } catch {
+        // Expected
+      }
+
+      // Must NOT have created file outside sandbox
+      expect(fs.existsSync(path.join(ctx.outsideDir, "moved.txt"))).toBe(false);
+      // Source file must still exist (move didn't partially succeed)
+      if (_name === "ReadWriteFs") {
+        expect(fs.existsSync(path.join(ctx.tempDir, "hello.txt"))).toBe(true);
+      }
+    });
+  });
+
+  describe("chmod through escape symlink (default deny)", () => {
+    it("blocks chmod on escape file symlink", async () => {
+      const origMode = fs.statSync(
+        path.join(ctx.outsideDir, "secret.txt"),
+      ).mode;
+      await expect(ctx.fsImpl.chmod("/escape-file", 0o777)).rejects.toThrow();
+      // Outside file permissions must be unchanged
+      const newMode = fs.statSync(path.join(ctx.outsideDir, "secret.txt")).mode;
+      expect(newMode).toBe(origMode);
+    });
+  });
+
+  describe("utimes through escape symlink (default deny)", () => {
+    it("blocks utimes on escape file symlink", async () => {
+      const origMtime = fs.statSync(
+        path.join(ctx.outsideDir, "secret.txt"),
+      ).mtimeMs;
+      const now = new Date();
+      await expect(
+        ctx.fsImpl.utimes("/escape-file", now, now),
+      ).rejects.toThrow();
+      // Outside file mtime must be unchanged
+      const newMtime = fs.statSync(
+        path.join(ctx.outsideDir, "secret.txt"),
+      ).mtimeMs;
+      expect(newMtime).toBe(origMtime);
+    });
+  });
+
+  describe("cp through escape symlink (default deny)", () => {
+    it("blocks cp from file through escape symlink", async () => {
+      await expect(
+        ctx.fsImpl.cp("/escape-file", "/stolen.txt"),
+      ).rejects.toThrow();
+    });
+
+    it("blocks cp to path through escape dir symlink", async () => {
+      try {
+        await ctx.fsImpl.cp("/hello.txt", "/escape-dir/planted.txt");
+      } catch {
+        // Expected
+      }
+
+      expect(fs.existsSync(path.join(ctx.outsideDir, "planted.txt"))).toBe(
+        false,
+      );
+    });
+  });
+
+  describe("link through escape symlink (default deny)", () => {
+    it("blocks hard link from escape symlink path", async () => {
+      await expect(
+        ctx.fsImpl.link("/escape-file", "/stolen.txt"),
+      ).rejects.toThrow();
+    });
+
+    it("blocks hard link to path through escape dir symlink", async () => {
+      try {
+        await ctx.fsImpl.link("/hello.txt", "/escape-dir/hardlinked.txt");
+      } catch {
+        // Expected
+      }
+
+      expect(fs.existsSync(path.join(ctx.outsideDir, "hardlinked.txt"))).toBe(
+        false,
+      );
+    });
+  });
+
+  describe("readdir through escape symlink (default deny)", () => {
+    it("does not list outside directory contents", async () => {
+      if (_name === "OverlayFs") {
+        // OverlayFs returns empty array for blocked symlink dirs
+        const entries = await ctx.fsImpl.readdir("/escape-dir");
+        expect(entries).toEqual([]);
+      } else {
+        // ReadWriteFs throws because resolveAndValidate rejects
+        await expect(ctx.fsImpl.readdir("/escape-dir")).rejects.toThrow();
+      }
+    });
+  });
+
+  describe("symlink chain that leaves and re-enters sandbox (default deny)", () => {
+    it("blocks read even if final target is within sandbox", async () => {
+      // With allowSymlinks: false, even a chain that comes back inside is
+      // blocked because resolveCanonicalPathNoSymlinks detects ANY symlink
+      // traversal via the path comparison check.
+      const backLink = path.join(ctx.outsideDir, "back-link");
+      try {
+        fs.symlinkSync(path.join(ctx.tempDir, "hello.txt"), backLink);
+        fs.symlinkSync(backLink, path.join(ctx.tempDir, "chain-escape"));
+      } catch {
+        return;
+      }
+
+      await expect(ctx.fsImpl.readFile("/chain-escape")).rejects.toThrow();
+    });
+  });
+
+  describe("self-referencing and mutual symlink loops (default deny)", () => {
+    it("self-referencing symlink does not hang", async () => {
+      try {
+        fs.symlinkSync("self-loop", path.join(ctx.tempDir, "self-loop"));
+      } catch {
+        return;
+      }
+      await expect(ctx.fsImpl.readFile("/self-loop")).rejects.toThrow();
+      await expect(ctx.fsImpl.stat("/self-loop")).rejects.toThrow();
+    });
+
+    it("mutual symlink loop (a->b, b->a) does not hang", async () => {
+      try {
+        fs.symlinkSync(
+          path.join(ctx.tempDir, "mut-b"),
+          path.join(ctx.tempDir, "mut-a"),
+        );
+        fs.symlinkSync(
+          path.join(ctx.tempDir, "mut-a"),
+          path.join(ctx.tempDir, "mut-b"),
+        );
+      } catch {
+        return;
+      }
+      await expect(ctx.fsImpl.readFile("/mut-a")).rejects.toThrow();
+      await expect(ctx.fsImpl.readFile("/mut-b")).rejects.toThrow();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // allowSymlinks: true restores full behavior
 // ---------------------------------------------------------------------------
 describe.each([
