@@ -58,6 +58,7 @@ Supports optional network access via \`curl\` with secure-by-default URL filteri
 - [Default Layout](#default-layout)
 - [Network Access](#network-access)
 - [Execution Protection](#execution-protection)
+- [AST Transform Plugins](#ast-transform-plugins)
 - [Development](#development)
 
 ## Security model
@@ -104,6 +105,22 @@ const env = new Bash({
 // Per-exec overrides
 await env.exec("echo $TEMP", { env: { TEMP: "value" }, cwd: "/tmp" });
 \`\`\`
+
+#### Lazy Files
+
+File values can be functions (sync or async). The function is called on first read and the result is cached — if the file is written to before being read, the function is never called:
+
+\`\`\`typescript
+const env = new Bash({
+  files: {
+    "/data/config.json": () => JSON.stringify({ key: "value" }),
+    "/data/remote.txt": async () => (await fetch("https://example.com")).text(),
+    "/data/static.txt": "always loaded",
+  },
+});
+\`\`\`
+
+This is useful for large or expensive-to-compute content that may not be needed.
 
 ### Custom Commands
 
@@ -467,6 +484,30 @@ const env = new Bash({
 
 All limits have sensible defaults. Error messages include hints on which limit to increase. Feel free to increase if your scripts intentionally go beyond them.
 
+## AST Transform Plugins
+
+Parse bash scripts into an AST, run transform plugins, and serialize back to executable bash. Useful for instrumenting scripts (e.g., capturing per-command stdout/stderr) or analyzing them (e.g., extracting command names) before execution.
+
+\`\`\`typescript
+import { Bash, BashTransformPipeline, TeePlugin, CommandCollectorPlugin } from "just-bash";
+
+// Standalone pipeline — output can be run by any shell
+const pipeline = new BashTransformPipeline()
+  .use(new TeePlugin({ outputDir: "/tmp/logs" }))
+  .use(new CommandCollectorPlugin());
+const result = pipeline.transform("echo hello | grep hello");
+result.script;             // transformed bash string
+result.metadata.commands;  // ["echo", "grep", "tee"]
+
+// Integrated API — exec() auto-applies transforms and returns metadata
+const bash = new Bash();
+bash.registerTransformPlugin(new CommandCollectorPlugin());
+const execResult = await bash.exec("echo hello | grep hello");
+execResult.metadata?.commands; // ["echo", "grep"]
+\`\`\`
+
+See [src/transform/README.md](src/transform/README.md) for the full API, built-in plugins, and how to write custom plugins.
+
 ## Development
 
 \`\`\`bash
@@ -695,7 +736,7 @@ limitations under the License.
 
 export const FILE_PACKAGE_JSON = `{
   "name": "just-bash",
-  "version": "2.9.2",
+  "version": "2.11.14",
   "description": "A simulated bash environment with virtual filesystem",
   "repository": {
     "type": "git",
@@ -950,7 +991,7 @@ cat data.csv | awk -F',' '{sum += $3} END {print sum}'
 - **32-bit integers only**: Arithmetic operations use 32-bit signed integers
 - **No job control**: No \`&\`, \`bg\`, \`fg\`, or process suspension
 - **No external binaries**: Only built-in commands are available
-- **Execution limits**: Loops, recursion, and command counts have configurable limits to prevent runaway execution
+- **Execution limits**: Loops, recursion, command counts, and output sizes have configurable limits to prevent runaway execution (exit code 126 when exceeded)
 
 ## Error Handling
 
@@ -971,6 +1012,7 @@ Common exit codes:
 - \`0\` - Success
 - \`1\` - General error or no matches (grep)
 - \`2\` - Misuse of command (invalid options)
+- \`126\` - Execution limit exceeded (loops, output size, string length)
 - \`127\` - Command not found
 
 ## Debugging Tips
@@ -984,8 +1026,36 @@ Common exit codes:
 
 - Virtual filesystem is isolated from the real system
 - Network access requires explicit URL allowlists
-- Execution limits prevent infinite loops
+- Execution limits prevent infinite loops and resource exhaustion
 - No shell injection possible (commands are parsed, not eval'd)
+
+### Execution Limits
+
+All limits are configurable via \`executionLimits\` in \`BashOptions\`:
+
+\`\`\`typescript
+const bash = new Bash({
+  executionLimits: {
+    maxCommandCount: 10000,      // Max commands per exec()
+    maxLoopIterations: 10000,    // Max bash loop iterations
+    maxCallDepth: 100,           // Max function recursion depth
+    maxStringLength: 10485760,   // Max string size (10MB)
+    maxArrayElements: 100000,    // Max array elements
+    maxGlobOperations: 100000,   // Max glob filesystem operations
+    maxAwkIterations: 10000,     // Max AWK loop iterations
+    maxSedIterations: 10000,     // Max sed branch loop iterations
+    maxJqIterations: 10000,      // Max jq loop iterations
+    maxSubstitutionDepth: 50,    // Max $() nesting depth
+    maxHeredocSize: 10485760,    // Max heredoc size (10MB)
+  },
+});
+\`\`\`
+
+**Output size limits**: AWK, sed, jq, and printf enforce \`maxStringLength\` on their output buffers. Commands that exceed the limit exit with code 126.
+
+**File read size limits**: \`OverlayFs\` and \`ReadWriteFs\` default to a 10MB max file read size. Override with \`maxFileReadSize\` in filesystem options (set to \`0\` to disable).
+
+**Network response size**: \`maxResponseSize\` in \`NetworkConfig\` caps HTTP response bodies (default: 10MB).
 
 ## Discovering Types
 

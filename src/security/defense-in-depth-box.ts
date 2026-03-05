@@ -62,16 +62,6 @@ function generateUUID(): string {
   });
 }
 
-/**
- * Import AsyncLocalStorage directly from node:async_hooks.
- * This is safe because:
- * - The Node.js entry point targets Node.js where async_hooks is always available
- * - Edge runtimes should use just-bash/browser which doesn't include security features
- * - The IS_BROWSER guard still prevents usage in browser builds
- * - async_hooks is external in all esbuild configs (--platform=node)
- */
-import { AsyncLocalStorage } from "node:async_hooks";
-
 type AsyncLocalStorageType<T> = {
   run<R>(store: T, callback: () => R): R;
   getStore(): T | undefined;
@@ -80,11 +70,20 @@ type AsyncLocalStorageType<T> = {
 let AsyncLocalStorageClass: (new <T>() => AsyncLocalStorageType<T>) | null =
   null;
 
-// Only use AsyncLocalStorage in Node.js (not in browser builds)
+// Only load AsyncLocalStorage in Node.js (not in browser builds).
+// Uses require() instead of a static import so that esbuild can
+// dead-code-eliminate this block in browser builds (static imports
+// cannot be tree-shaken even when unused).
 if (!IS_BROWSER) {
-  AsyncLocalStorageClass = AsyncLocalStorage as unknown as
-    | (new <T>() => AsyncLocalStorageType<T>)
-    | null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { AsyncLocalStorage } = require("node:async_hooks");
+    AsyncLocalStorageClass = AsyncLocalStorage as
+      | (new <T>() => AsyncLocalStorageType<T>)
+      | null;
+  } catch {
+    // Not available (edge runtimes, restricted environments)
+  }
 }
 
 /**
